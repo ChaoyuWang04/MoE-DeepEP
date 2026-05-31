@@ -1,12 +1,67 @@
-# Python-generated files
+# ---- Python ----
 __pycache__/
 *.py[oc]
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
 
-# Virtual environments
-.venv
+# ---- Virtual environments ----
+.venv/
+venv/
+# NOTE: uv.lock is intentionally tracked (reproducible builds)
 
+# ---- CUDA / native build artifacts ----
+*.o
+*.obj
+*.so
+*.a
+*.cubin
+*.ptx
+*.fatbin
+compile_commands.json
+
+# ---- Vendored external sources (cloned, not committed) ----
 reference/DeepEP/
+reference/nvshmem/
+
+# ---- Model weights / checkpoints (downloaded, large) ----
+models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.gguf
+
+# ---- Captured traces / generated data ----
+data/*
+!data/README.md
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# ---- Profiling outputs ----
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.sqlite
+
+# ---- Logs & local scratch ----
+*.log
+logs/
+wandb/
+outputs/
+tmp/
+scratch/
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+.DS_Store
+._*
