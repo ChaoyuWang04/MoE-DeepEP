@@ -1,28 +1,19 @@
 """
-[Phase 0] capture_routing.py — 跑通 MoE 模型并抓取真实路由（monkeypatch 版）
+[Phase 0] capture_routing.py — 跑通 MoE 模型并抓取真实路由（最终版）
 
 做什么:
-    加载 DeepSeek-V2-Lite，抓取每个 token 在每个 MoE 层选中的专家(topk_idx)与权重
-    (topk_weight)，作为 Phase 2 all-to-all 的真实数据源。
+    抓取每个 token 在每个 MoE 层选中的专家(topk_idx)与权重(topk_weight)。
 
-    为什么不用 register_forward_hook（关键认知）:
-        在 accelerate 的 CPU offload 下，模块调用被重新包装成直接走 forward，
-        不经过 nn.Module.__call__ 的 hook 派发 —— 于是 forward(_pre)_hook 一次都不触发。
-        鲁棒做法: 直接 monkeypatch gate 实例的 forward 方法本身（每条调用路径必经此处）。
+    定位经过（踩坑总结，已写进 design_notes）:
+        本版 HF modeling (DeepseekV2Moe) 的 routing 不在 gate.forward 里产出——
+        gate 只是普通 Linear(存权重)，forward 用 F.linear(hidden, gate.weight) 内联算 logits，
+        再交给 self.route_tokens_to_experts(router_logits) 返回 (topk_indices, topk_weights)。
+        所以正确拦截点是 route_tokens_to_experts，而非 gate.forward / forward hook。
+        教训: 工具失效时先 inspect.getsource 看实现，再决定拦哪里，别对黑盒连打补丁。
 
-    其它保留: 首次触发打印 gate 返回结构作证据；按 dtype 自动认 idx(整型)/weight(浮点)，
-    不怕返回顺序与版本差异；抓到空则 raise，绝不静默存空。
-
-输入:
-    - 模型权重 (config.MODEL_DIR 优先；否则 config.MODEL_NAME)
-    - PROMPTS: 几大段真实长文本
-输出:
-    - datas/routing_traces/deepseek_v2_lite.pt
-      结构: {layer_idx: (topk_idx[T,k] long, topk_weight[T,k] float)}
-
-运行:
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-      uv run python -m src.phase0_moe_literacy.capture_routing
+输入:  模型权重 + PROMPTS
+输出:  datas/routing_traces/deepseek_v2_lite.pt  结构 {layer_idx: (idx[T,k] long, wgt[T,k] float)}
+运行:  uv run python -m src.phase0_moe_literacy.capture_routing
 """
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -30,39 +21,39 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from src.common import config
 from src.common.trace_io import save_trace
 
-_traces = {}                         # layer_idx -> list[(idx_cpu, wgt_cpu)]
-_fired = {"n": 0}                    # gate.forward 被调用的总次数
+# "gpu8bit": 8-bit 全上 GPU(~16GB)，快，路由有极小量化扰动但不改变负载分布结论。【默认】
+# "gpu4bit": 4-bit(~9GB)，更省显存。
+# "cpu":     纯 bf16 CPU 前向，路由 bit-exact，慢，需 ~36GB 内存。【要绝对精确路由时用】
+LOAD_MODE = "gpu8bit"
+
+_traces = {}
+_fired = {"n": 0}
 _structure_printed = {"done": False}
 
 
 def _tensors_in(output):
-    """从 gate 返回值里挑出所有 tensor，兼容 tuple/list/namedtuple/单 tensor。"""
     seq = output if isinstance(output, (tuple, list)) else [output]
     return [o for o in seq if torch.is_tensor(o)]
 
 
 def _extract_idx_weight(output):
-    """按 dtype 认: 整型=topk_idx, 浮点=topk_weight。不依赖返回顺序。"""
+    """按 dtype 认: 整型=topk_idx, 浮点=topk_weight。route_tokens_to_experts 返回 (idx, wgt)。"""
     tensors = _tensors_in(output)
     idx = next((t for t in tensors if not t.is_floating_point()), None)
     wgt = next((t for t in tensors if t.is_floating_point()), None)
     return idx, wgt
 
 
-def _patch_gate_forward(gate, layer_idx):
-    """monkeypatch 单个 gate 实例的 forward: 调原 forward -> 记录 -> 原样返回。
+def _patch_router(mlp, layer_idx):
+    """monkeypatch mlp.route_tokens_to_experts: 调原方法 -> 记录 (idx, wgt) -> 原样返回。"""
+    orig = mlp.route_tokens_to_experts                # 关键行: 真正产出路由的方法
 
-    关键: orig_forward 可能已是 accelerate 的包装(含设备对齐)，我们包在它外面，
-    既不破坏 offload 的搬运逻辑，又能拿到真实输出。
-    """
-    orig_forward = gate.forward                      # 关键行: 可能是 accelerate 包装后的 forward
-
-    def patched(*args, **kwargs):
-        out = orig_forward(*args, **kwargs)          # 关键行: 先跑原逻辑(含 offload 搬运)
+    def patched(router_logits, *args, **kwargs):
+        out = orig(router_logits, *args, **kwargs)    # out = (topk_indices, topk_weights)
         _fired["n"] += 1
-        if not _structure_printed["done"]:           # 首次打印真实结构作证据
+        if not _structure_printed["done"]:
             _structure_printed["done"] = True
-            print(f"[capture][gate output] type={type(out)}")
+            print(f"[capture][route output] type={type(out)}")
             for j, o in enumerate(_tensors_in(out)):
                 print(f"    tensor[{j}] shape={tuple(o.shape)} dtype={o.dtype} device={o.device}")
         idx, wgt = _extract_idx_weight(out)
@@ -71,7 +62,7 @@ def _patch_gate_forward(gate, layer_idx):
                 (idx.detach().to("cpu"), wgt.detach().to("cpu")))
         return out
 
-    gate.forward = patched                           # 关键行: 替换实例 forward，覆盖所有调用路径
+    mlp.route_tokens_to_experts = patched
 
 
 PROMPTS = [
@@ -104,18 +95,34 @@ PROMPTS = [
 ]
 
 
+def _load_model(src):
+    if LOAD_MODE == "cpu":
+        return AutoModelForCausalLM.from_pretrained(
+            src, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
+        ).eval()
+    from transformers import BitsAndBytesConfig
+    if LOAD_MODE == "gpu8bit":
+        qcfg = BitsAndBytesConfig(load_in_8bit=True)
+    elif LOAD_MODE == "gpu4bit":
+        qcfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
+    else:
+        raise ValueError(f"未知 LOAD_MODE: {LOAD_MODE}")
+    return AutoModelForCausalLM.from_pretrained(
+        src, quantization_config=qcfg, device_map={"": 0},
+    ).eval()
+
+
 def main():
     src = str(config.MODEL_DIR) if config.MODEL_DIR.exists() else config.MODEL_NAME
-    tok = AutoTokenizer.from_pretrained(src, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        src, dtype=torch.bfloat16,
-        device_map="auto", low_cpu_mem_usage=True,
-    ).eval()
+    tok = AutoTokenizer.from_pretrained(src)
+    print(f"[capture] LOAD_MODE={LOAD_MODE}")
+    model = _load_model(src)
+    dev = "cpu" if LOAD_MODE == "cpu" else "cuda"
 
     n_patched = 0
     for i, layer in enumerate(model.model.layers):
-        if hasattr(layer.mlp, "gate"):
-            _patch_gate_forward(layer.mlp.gate, i)   # 关键行: monkeypatch 而非 register_hook
+        if hasattr(layer.mlp, "route_tokens_to_experts"):   # 只有 MoE 层有此方法
+            _patch_router(layer.mlp, i)
             n_patched += 1
     print(f"[capture] 已 patch 的 MoE 层数: {n_patched}")
     print(f"[capture] n_routed_experts={model.config.n_routed_experts}, "
@@ -123,17 +130,14 @@ def main():
 
     with torch.no_grad():
         for p in PROMPTS:
-            ids = tok(p, return_tensors="pt").to(model.device)
+            ids = tok(p, return_tensors="pt").to(dev)
             model(**ids)
 
-    print(f"[capture] gate.forward 调用次数: {_fired['n']}")
+    print(f"[capture] route_tokens_to_experts 调用次数: {_fired['n']}")
     if _fired["n"] == 0:
-        raise RuntimeError(
-            "monkeypatch 后 gate.forward 仍未被调用 -> layer.mlp.gate 不是运行时对象，"
-            "请把 print(model.model.layers[1].mlp) 的结构发我。")
+        raise RuntimeError("route_tokens_to_experts 未被调用，把 print(model.model.layers[1].mlp) 发我。")
     if len(_traces) == 0:
-        raise RuntimeError(
-            "gate.forward 调用了但没抓到 idx/weight -> 返回结构异常，把上面 [gate output] 结构发我。")
+        raise RuntimeError("调用了但没抓到 idx/weight，把上面 [route output] 结构发我。")
 
     merged = {}
     for layer_idx, items in _traces.items():

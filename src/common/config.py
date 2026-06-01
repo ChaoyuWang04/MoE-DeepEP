@@ -13,7 +13,7 @@ from pathlib import Path
 
 # ---- 路径 ----
 ROOT = Path(__file__).resolve().parents[2]          # 仓库根目录
-DATA_DIR = ROOT / "datas"
+DATA_DIR = ROOT / "data"
 TRACE_DIR = DATA_DIR / "routing_traces"
 MODEL_DIR = ROOT / "models" / "DeepSeek-V2-Lite"
 
