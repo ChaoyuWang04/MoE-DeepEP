@@ -65,3 +65,5 @@ scratch/
 .idea/
 .DS_Store
 ._*
+
+nsys_ncu_outputs/
