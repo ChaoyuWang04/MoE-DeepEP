@@ -122,6 +122,60 @@
   散射回原 token"将变成【跨卡 all-to-all 通信本身】。Phase 1 优化掉的数据搬运，Phase 2 会
   以"通信"形式重现，而那正是 DeepEP 要解决的核心。完美衔接。
 
+
+### 已知可优化项（暂不做，完成度优先）
+- Triton kernel 的 BLOCK_M/N/K 当前写死(64/128/64)，未用 @triton.autotune 搜索。
+  ncu 实测 fused kernel occupancy 仅 ~8.33% 但算力占比 ~80%+ —— 少量大 tile 占满 tensor
+  core，但 SM 级并行度(occupancy)低。autotune 搜索 BLOCK + num_warps/num_stages 有望
+  提 occupancy。Phase 2 之后若有余力再回来。
+- 硬件方案: Phase 2 本地双卡 RTX 5090 即可(NCCL all-to-all 走 PCIe/P2P，不需 NVLink)，
+  覆盖自研实现全部 + naive/ours 对比。仅"对标真 DeepEP"需 Hopper(NVSHMEM/IBGDA)，
+  到时再 Modal/RunPod 短租 2×H100 一次即可，平时省钱。
+
+
+## Phase 2 进展（专家并行通信）
+- ep_reference: 单进程模拟 dispatch/expert/combine，对拍"不分卡直算" max_diff=0 —— 证明
+  分卡+all2all 数学等价于单卡(通信只搬数据不改结果)。
+- 真·多进程: torchrun 起 N 进程。NCCL 要求一卡一 rank(两 rank 共卡报 Duplicate GPU)；
+  本地单卡验证用 gloo 后端(CPU 通信，允许多 rank 共卡)，all2all 前后搬 CPU 中转。
+  认知: NCCL=GPU通信/一卡一rank；gloo=CPU通信/可共卡，适合本地调通信逻辑。性能/对标才上真双卡。
+- dispatch 3→2 次 all2all(用户最早洞察落地): 发"每全局专家行数"细账单，recv_counts 由
+  recv_per_expert.view(ws,E_local).sum(1) 本地 group-sum 推出；逐 token expert_id 用
+  repeat_interleave 本地生成 —— 省掉第 3 次 all2all(O(N_recv) ints)。token 越多省越多。
+- Phase1/2 合流: expert_compute_fused 复用 Phase1 融合 grouped GEMM 做本地专家计算。
+  难点: dispatch 后同一本地专家的 token 散在各源 rank 段(不连续)，需按本地专家 argsort
+  聚拢→对齐分段→融合kernel→inv_order 还原。3 组随机(含非均匀权重)对拍 ALL PASS。
+
+## Triton autotune 用法（踩坑总结）
+- 交给 @triton.autotune 搜索的符号(BLOCK_*/num_stages/num_warps)，launch 时【绝不能】再手动
+  传，否则 "Conflicting meta-parameters"。
+- grid 依赖 BLOCK_*(autotune 动态选)，必须写 grid=lambda META: (..., cdiv(K, META['BLOCK_N']))。
+- 本项目 tile_expert(每 tile 属哪个专家)依赖 BLOCK_M → configs 固定 BLOCK_M=64、只搜
+  BLOCK_N/K/stages/warps，tile_expert 按 64 预算一次。这是 autotune 搜索空间与 host 预计算
+  耦合度的工程权衡。
+- 首次调用 autotune 会实跑各 config 计时选最优(慢几秒)，同 key 后续复用。CUDA Graph capture
+  期间不可触发 autotune(须先充分预热)。
+- 效果: fused 16384 档 12.9→11.97ms 小幅再优；occupancy(原 ~8.33%)部分缓解，未根治
+  (BLOCK_M 固定所限)，列为已知项。
+
+
+## Phase 2 云端实测：通信-计算重叠是负优化(H100 NVLink 场景)
+- 环境: 2×H100 80GB, NCCL, 单层 MoE(E=64, top-6, H=2048, I=1408)。
+- 扫 token(chunks=4) 重叠提升单调上升但永不破 1:
+    2048→0.47 | 8192→0.69 | 32768→0.87 | 65536→0.96
+- 扫 chunk(tokens=32768) 单调变差,无甜点:
+    1→0.99 | 2→0.95 | 4→0.89 | 8→0.75
+- 根因(nsys 时间线印证): 单次 dispatch 仅 0.5~4.2ms,占总时间 ~10%(计算占 ~90%)。
+    通信不是瓶颈 → 可藏的通信时间极小;而切 N chunk → 通信次数×N → NCCL per-call 固定
+    开销(launch+group 同步)线性增长。nsys 见每个 kernel 极小、gap > kernel,GPU 在 gap
+    里空泡(等下一个小通信被发起),不是在算。
+- 结论: H100 NVLink 高带宽 + 单层 MoE 计算占主导下,重叠收益(藏 10% 通信) < 切分开销,
+    故 ≤1.0。重叠要划算需: (a)单次通信开销低(DeepEP 用 IBGDA/RDMA/零SM hook 压到极低);
+    (b)通信占比高(多机跨节点 RDMA、更大 EP 规模、prefill 长序列)。
+- 这是 DeepEP 的反面证明: 我们在 PyTorch+NCCL 层做重叠失败,正因为没解决"小消息通信固定
+    开销"这个 DeepEP 真正攻克的问题。失败数据 > 空泛的"加速 X%"。
+- 方法论: 扫 token / 扫 chunk 两个单调趋势 + nsys gap 观察,三者交叉印证,假设被数据证实。
+
 ## 踩坑记录（随做随记）
 - token_map 存的是 append 后长度(1-indexed)，取值要 index-1（off-by-one 高发区）。
 - 抓 MoE 路由的拦截点：本版 HF DeepseekV2Moe 的 routing 不在 gate.forward（gate 只是
