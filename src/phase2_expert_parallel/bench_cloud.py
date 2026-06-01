@@ -122,6 +122,15 @@ def main():
     if rank == 0:
         print(f"[rank 0] 单次 dispatch(2 all2all) {t_disp:.3f} ms")
 
+    # 自研【纯通信】dispatch+combine(恒等专家)，与 DeepEP 同类项对比
+    def ours_comm_only():
+        recv_x, rle, sp = dispatch_2a2a(x, idx, E, world_size, rank, comm_on_cpu)
+        # 恒等专家: 直接拿 recv_x 当输出送回 combine，只测通信
+        combine_2a2a(recv_x, wgt, sp, world_size, rank, x.shape[1], comm_on_cpu)
+    t_comm = cuda_time_ms(ours_comm_only, warmup=5, iters=30)
+    if rank == 0:
+        print(f"[rank 0] 自研纯通信 dispatch+combine(恒等专家) {t_comm:.3f} ms  <- 与 DeepEP 同类项")
+
     # ---- 4. DeepEP 对标(若可用) ----
     try:
         import deep_ep  # noqa
