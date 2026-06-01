@@ -176,6 +176,20 @@
     开销"这个 DeepEP 真正攻克的问题。失败数据 > 空泛的"加速 X%"。
 - 方法论: 扫 token / 扫 chunk 两个单调趋势 + nsys gap 观察,三者交叉印证,假设被数据证实。
 
+
+## Phase 2 收尾：DeepEP 单机无法初始化(IB 依赖) = 其设计边界的实证
+- DeepEP low_latency_dispatch/combine 强制走 NVSHMEM/IBGDA，需 InfiniBand 网卡 + libibverbs。
+- 单机 H100(卡间 NVLink，无 IB 网卡)上 NVSHMEM 初始化失败:
+    "Unable to dlopen libibverbs / nvshmem transport init failed"。
+    试 NVSHMEM_REMOTE_TRANSPORT=none 仍失败(init 路径仍依赖 IB 库)。
+- 结论(不是 bug，是 DeepEP 的设计前提): DeepEP 低延迟路径为【多机跨节点 RDMA】而生，
+    存在前提即 IB 网络。单机 NVLink 既不需要它、也跑不起它 —— init 失败本身就是答案。
+- 自研侧实测(单机 2×H100, 4096 token): 纯通信 dispatch+combine = 1.443ms，
+    单次 dispatch = 0.656ms，串行完整层 3.70ms(通信占比不高)。
+- 完整数据链回答"DeepEP 解决什么": 单机通信(1.44ms)不是瓶颈→重叠负优化(≤0.96)→
+    DeepEP 招牌路径单机跑不起来(需 IB)。三者共同指向: MoE 通信瓶颈在多机跨节点小消息，
+    DeepEP 用 IBGDA/RDMA 攻克的正是该场景。这是用"跑不起来"反证设计意图的有力证据。
+
 ## 踩坑记录（随做随记）
 - token_map 存的是 append 后长度(1-indexed)，取值要 index-1（off-by-one 高发区）。
 - 抓 MoE 路由的拦截点：本版 HF DeepseekV2Moe 的 routing 不在 gate.forward（gate 只是
